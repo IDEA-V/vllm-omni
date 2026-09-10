@@ -160,6 +160,67 @@ def test_fused_routing_ties_break_towards_the_lowest_expert() -> None:
 
 
 @hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@pytest.mark.parametrize("bias_shape", [(4, 1), (4,), (4, 1, 1)])
+def test_broadcast_expert_bias_matches_reference(bias_shape: tuple[int, ...]) -> None:
+    """A per-head scalar bias broadcasts in the reference and must in the kernel.
+
+    The kernel indexes a dense ``[heads, num_experts]`` bank, so a bias holding
+    one element per head is expanded before launch instead of being read past
+    the end of its own storage.
+    """
+
+    logits, _ = _router_inputs(4, 128, 64, device="cuda", with_bias=False)
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    expert_bias = torch.randn(4, device="cuda", generator=generator).reshape(bias_shape)
+    reference = _reference_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
+    fused = compute_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
+    resolvable = _resolvable_rows(logits, expert_bias, 5)
+    assert torch.equal(fused[1][resolvable], reference[1][resolvable])
+    # A bias decouples the selection score from the route weight, so an
+    # unresolvable row disagrees on the weight too; mask both.
+    torch.testing.assert_close(
+        fused[0][resolvable], reference[0][resolvable], rtol=ROUTE_WEIGHT_RTOL, atol=ROUTE_WEIGHT_ATOL
+    )
+
+
+@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float16])
+def test_narrow_dtype_expert_bias_matches_reference(bias_dtype: torch.dtype) -> None:
+    """Upcasting a narrow bias is exactly the promotion the reference performs."""
+
+    logits, expert_bias = _router_inputs(4, 128, 64, device="cuda")
+    expert_bias = expert_bias.to(bias_dtype)
+    reference = _reference_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
+    fused = compute_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
+    resolvable = _resolvable_rows(logits, expert_bias, 5)
+    assert torch.equal(fused[1][resolvable], reference[1][resolvable])
+    # A bias decouples the selection score from the route weight, so an
+    # unresolvable row disagrees on the weight too; mask both.
+    torch.testing.assert_close(
+        fused[0][resolvable], reference[0][resolvable], rtol=ROUTE_WEIGHT_RTOL, atol=ROUTE_WEIGHT_ATOL
+    )
+
+
+@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+def test_exhausted_selection_scores_still_pick_distinct_experts() -> None:
+    """Selecting an expert must retire it even when every candidate left is -inf.
+
+    A bias that masks the bank down to fewer than ``top_k`` finite scores lets a
+    retired winner tie the running maximum, so a kernel that excludes by score
+    alone routes the same expert twice.
+    """
+
+    logits = torch.zeros(1, 4, 8, device="cuda")
+    expert_bias = torch.full((1, 8), float("-inf"), device="cuda")
+    expert_bias[0, 2] = 0.0
+    _, indices = compute_topk_probs_and_indices(logits, 3, expert_bias=expert_bias, route_norm=False)
+    for row in indices[0]:
+        assert row.unique().numel() == 3, f"duplicate route in {row.tolist()}"
+    # Expert 2 holds the only finite score; the -inf remainder resolves by id.
+    assert indices[0, 0].tolist() == [2, 0, 1]
+
+
+@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 @pytest.mark.parametrize(("heads", "tokens", "experts", "top_k"), ROUTING_SHAPES)
 def test_global_sort_routes_is_bit_identical_to_reference(heads: int, tokens: int, experts: int, top_k: int) -> None:
     logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")

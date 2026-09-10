@@ -76,6 +76,11 @@ def _reference_topk_probs_and_indices(
     return topk_probs, topk_indices
 
 
+# Retirement sentinel floor: the largest finite negative fp32, so that -inf is
+# reserved for lanes the top-k loop has already consumed.
+_MIN_FINITE_FP32 = tl.constexpr(-3.4028234663852886e38)
+
+
 @triton.jit
 def _routing_topk_kernel(
     logits_ptr,
@@ -130,9 +135,17 @@ def _routing_topk_kernel(
         router_scores = 1.0 / (1.0 + tl.exp(-logits))
     if has_bias:
         bias = tl.load(bias_ptr + head * num_experts + expert_offsets, mask=expert_mask, other=0.0)
-        selection_scores = router_scores + bias[None, :]
+        # The loop below retires a winner by marking it -inf, so -inf must stay
+        # out of reach for anything still selectable.  An unbiased sigmoid is
+        # inside (0, 1), so the bias is the only way in: clamp it to the largest
+        # finite negative float, over the [experts] bank rather than the whole
+        # score tile.
+        selection_scores = router_scores + tl.maximum(bias, _MIN_FINITE_FP32)[None, :]
     else:
         selection_scores = router_scores
+    # Dead and padded lanes keep -inf and stay unreachable for good, which is
+    # sound because ``top_k <= num_experts`` leaves an unretired live lane in
+    # every round.
     selection_scores = tl.where(live, selection_scores, float("-inf"))
 
     route_offsets = tl.arange(0, top_k_pad)
@@ -143,7 +156,9 @@ def _routing_topk_kernel(
         best_score = tl.max(selection_scores, axis=1)
         # tl.argmax is several times more expensive than a plain max on this
         # shape, so recover the winner with a second reduction.  Ties resolve to
-        # the lowest expert id, which torch.topk leaves unspecified.
+        # the lowest expert id, which torch.topk leaves unspecified.  A retired
+        # expert sits at -inf, strictly below the clamp above, so it can never
+        # match ``best_score`` and be routed to twice.
         best_expert = tl.min(tl.where(selection_scores == best_score[:, None], expert_offsets, experts_pad), axis=1)
         selected = expert_offsets[None, :] == best_expert[:, None]
         # The bias steers selection only; the route weight is the unbiased score.
@@ -193,9 +208,31 @@ def _fused_routing_supported(
         return False
     if triton.next_power_of_2(router_logits.shape[-1]) > _MAX_FUSED_EXPERTS_PAD:
         return False
-    if expert_bias is not None and (expert_bias.dtype != torch.float32 or not expert_bias.is_contiguous()):
+    # Only contiguity is load bearing: the reference reshapes the bias with
+    # ``view``, and so does :func:`_dense_expert_bias`.  Narrow dtypes and the
+    # broadcast shapes the reference accepts are normalized there instead of
+    # costing the whole fused path.
+    if expert_bias is not None and not expert_bias.is_contiguous():
         return False
     return True
+
+
+def _dense_expert_bias(expert_bias: torch.Tensor, heads: int, num_experts: int) -> torch.Tensor:
+    """Return the dense fp32 ``[heads, num_experts]`` bank the kernel indexes.
+
+    The reference broadcasts the bias with ``expert_bias.view(heads, 1, -1)``, so
+    a per-head scalar is legal input, while the kernel reads ``heads *
+    num_experts`` elements.  Materialize that broadcast rather than drop to the
+    reference for a bank this small, and upcast narrow dtypes, which is exactly
+    the promotion the reference gets from adding the bias to fp32 scores.
+
+    ``view`` and ``expand`` reject the shapes the reference's own broadcast
+    rejects, ``contiguous`` is what actually retires the zero stride ``expand``
+    leaves behind, and every step is a no-op for a dense fp32 bias.
+    """
+
+    dense = expert_bias.view(heads, -1).expand(heads, num_experts)
+    return dense.to(torch.float32).contiguous()
 
 
 def compute_topk_probs_and_indices(
@@ -212,8 +249,8 @@ def compute_topk_probs_and_indices(
     The auxiliary-free bias affects expert selection but deliberately does not
     affect the returned routing probability, matching the training recipe.
 
-    Supported CUDA inputs run as a single fused kernel; other devices, dtypes,
-    score functions and shapes fall back to
+    Supported CUDA inputs run as a single fused kernel; other devices, logit
+    dtypes, score functions and shapes fall back to
     :func:`_reference_topk_probs_and_indices`.  The two pick the same experts in
     the same order whenever the top ``top_k + 1`` selection scores of a row are
     separated by more than a few ULP, and the returned weights then agree to
@@ -238,6 +275,8 @@ def compute_topk_probs_and_indices(
         )
 
     heads, num_tokens, num_experts = router_logits.shape
+    if expert_bias is not None:
+        expert_bias = _dense_expert_bias(expert_bias, heads, num_experts)
     experts_pad = triton.next_power_of_2(num_experts)
     block_t, num_warps = _fused_routing_config(experts_pad)
     tiles_per_head = triton.cdiv(num_tokens, block_t)
