@@ -77,8 +77,9 @@ def _reference_topk_probs_and_indices(
 
 
 # Retirement sentinel floor: the largest finite negative fp32, so that -inf is
-# reserved for lanes the top-k loop has already consumed.
-_MIN_FINITE_FP32 = tl.constexpr(-3.4028234663852886e38)
+# reserved for lanes the top-k loop has already consumed.  Guarded like the
+# SwiGLU7 constants above, since the placeholder's ``tl.constexpr`` is ``None``.
+_MIN_FINITE_FP32 = tl.constexpr(-3.4028234663852886e38) if HAS_TRITON else -3.4028234663852886e38
 
 
 @triton.jit

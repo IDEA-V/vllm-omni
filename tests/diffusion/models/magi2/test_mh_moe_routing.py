@@ -10,6 +10,11 @@ bit-identical CSR layout.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -21,8 +26,11 @@ from vllm_omni.diffusion.models.magi2.mh_moe import (
     global_sort_routes,
     torch_mh_moe_forward,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 # ``heads, tokens, experts, top_k``.  The released MAGI-2 Preview bank is
 # ``(12, S, 256, 6)``; the rest cover padding, non-power-of-two banks and the
@@ -313,14 +321,62 @@ def test_routing_rejects_malformed_inputs() -> None:
         global_sort_routes(probs, indices[..., :2], 16)
 
 
+# vLLM swaps ``triton``/``triton.language`` for stubs whose attributes are
+# ``None`` as soon as it finds no active Triton driver, which is what any
+# GPU-less worker sees -- the CPU/Gloo DLO tests, or a Ray actor before its
+# CUDA context exists.  An unguarded module-level ``tl.constexpr(...)`` then
+# raises ``TypeError: 'NoneType' object is not callable`` while ``mh_moe`` is
+# still loading, and the caller only sees the child process exit.  Every such
+# constant is behind ``HAS_TRITON``; this keeps the next one from slipping in.
+# Import in a fresh interpreter with the stubs already in place: doing it
+# in-process would pass no matter what, because Triton is loaded for real by
+# then.
+_STUBBED_TRITON_IMPORT = """
+import vllm.triton_utils as triton_utils
+from vllm.triton_utils.importing import TritonLanguagePlaceholder, TritonPlaceholder
+
+triton_utils.HAS_TRITON = False
+triton_utils.triton = TritonPlaceholder()
+triton_utils.tl = TritonLanguagePlaceholder()
+
+import vllm_omni.diffusion.models.magi2.mh_moe  # noqa: F401
+"""
+
+
+@pytest.mark.cpu
+def test_module_imports_without_an_active_triton_driver() -> None:
+    """``mh_moe`` must load on the vLLM Triton placeholder, not just on a GPU."""
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["HIP_VISIBLE_DEVICES"] = ""
+    result = subprocess.run(
+        [sys.executable, "-c", _STUBBED_TRITON_IMPORT],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 # Route construction is deterministic in its output but not in its latency, and
 # CI spans L4, H100 and B200, so an absolute microsecond baseline would be
 # either meaningless or flaky.  Gate on the speedup over the reference measured
-# in the same process on the same device instead: that cancels the hardware
-# difference.  Observed on a B200 (torch 2.13, Triton 3.7.1): 6.1x at 4096
-# tokens and 11.1x at 29184.  The floor below leaves roughly half of that as
-# headroom, so it catches a real regression -- or the fused path silently
-# falling back -- without tracking normal run-to-run spread.
+# in the same process on the same device instead.  That removes the noise of
+# comparing across runners, but it does not cancel the hardware difference: the
+# reference's ``torch.topk`` / ``torch.sort`` and the fused kernel's codegen
+# scale differently per architecture and backend, so a floor measured on one
+# vendor does not carry over to another.  Observed on a B200 (torch 2.13, Triton
+# 3.7.1): 6.1x at 4096 tokens and 11.1x at 29184; that is the only calibrated
+# measurement, and the other SKUs in the marker list ride on its headroom.  The
+# floor below leaves roughly half of the B200 margin, so it catches a real
+# regression -- or the fused path silently falling back -- without tracking
+# normal run-to-run spread.  MI300 lands at 2.16x on the same shape, so the gate
+# stays CUDA-only until a ROCm floor is calibrated from its own repeated
+# measurements rather than from one CI sample.
 ROUTING_SPEEDUP_FLOOR = 3.0
 
 
@@ -341,10 +397,17 @@ def _median_microseconds(operation, *, warmup: int = 10, iterations: int = 30) -
     return statistics.median(samples)
 
 
+# ``hardware_test`` only attaches markers for a single-platform, single-card
+# entry, so it selects CI jobs without keeping the test off other platforms.
+# The floor is NVIDIA-only, hence the explicit platform guard.
+@pytest.mark.skipif(
+    not current_omni_platform.is_cuda(),
+    reason="Routing speedup floor is calibrated on NVIDIA CUDA only",
+)
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 def test_fused_routing_stays_faster_than_the_reference() -> None:
-    """Regression gate on the M1 route-construction speedup."""
+    """Regression gate on the M1 route-construction speedup (CUDA only)."""
 
     heads, tokens, experts, top_k = 12, 4096, 256, 6
     logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
