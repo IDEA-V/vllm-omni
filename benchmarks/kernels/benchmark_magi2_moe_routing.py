@@ -30,12 +30,14 @@ from collections.abc import Callable
 import torch
 from vllm.triton_utils import triton
 
-from vllm_omni.diffusion.models.magi2.mh_moe import (
+from vllm_omni.diffusion.models.magi2.fused_moe_kernels import (
     _reference_global_sort_routes,
-    _reference_topk_probs_and_indices,
-    compute_topk_probs_and_indices,
     global_sort_routes,
     triton_mh_moe_forward,
+)
+from vllm_omni.diffusion.models.magi2.mh_moe import (
+    _reference_topk_probs_and_indices,
+    compute_topk_probs_and_indices,
 )
 
 MiB = 1024**2
