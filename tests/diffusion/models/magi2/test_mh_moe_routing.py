@@ -229,6 +229,51 @@ def test_exhausted_selection_scores_still_pick_distinct_experts() -> None:
 
 
 @hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@pytest.mark.parametrize("route_norm", [True, False])
+def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> None:
+    """NaN selection scores rank first, as in torch.topk, and never leak ids.
+
+    ``tl.max`` does not propagate NaN, so an all-NaN row used to match no live
+    lane and store the padded sentinel id ``num_experts`` in every slot, which
+    ``global_sort_routes`` would alias to expert 0 of the next head.
+    """
+
+    heads, tokens, experts, top_k = 2, 16, 12, 4
+    logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
+    logits[0, 0] = float("nan")
+    logits[1, 3, [9, 4]] = float("nan")
+    # A NaN bias also makes the selection score NaN, but not the route weight.
+    expert_bias[1, 7] = float("nan")
+    reference_probs, reference_indices = _reference_topk_probs_and_indices(
+        logits, top_k, expert_bias=expert_bias, route_norm=route_norm
+    )
+    probs, indices = compute_topk_probs_and_indices(logits, top_k, expert_bias=expert_bias, route_norm=route_norm)
+
+    assert int(indices.min()) >= 0 and int(indices.max()) < experts
+    assert (indices.sort(dim=-1).values.diff(dim=-1) > 0).all(), "duplicate route"
+    # NaN rows come out NaN exactly where the reference's do.
+    assert torch.equal(probs.isnan(), reference_probs.isnan())
+
+    # Order among NaN lanes is unspecified in torch.topk; the kernel breaks the
+    # tie by expert id like any other.
+    assert indices[0, 0].tolist() == list(range(top_k))
+    assert indices[1, 3, :3].tolist() == [4, 7, 9]
+    assert indices[1, 5, 0] == 7
+    for head, token in ((0, 0), (1, 3)):
+        assert set(indices[head, token].tolist()) == set(reference_indices[head, token].tolist())
+
+    # Every other row is ordered by finite scores behind at most one NaN lane,
+    # which is unambiguous.  Folding the NaN bias to +inf lets the resolvability
+    # check see that; the NaN-logit rows fail it and are covered above.
+    resolvable = _resolvable_rows(logits, expert_bias.nan_to_num(nan=float("inf")), top_k)
+    assert int(resolvable.sum()) >= heads * tokens - 4
+    assert torch.equal(indices[resolvable], reference_indices[resolvable])
+    torch.testing.assert_close(
+        probs[resolvable], reference_probs[resolvable], rtol=ROUTE_WEIGHT_RTOL, atol=ROUTE_WEIGHT_ATOL
+    )
+
+
+@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 @pytest.mark.parametrize(("heads", "tokens", "experts", "top_k"), ROUTING_SHAPES)
 def test_global_sort_routes_is_bit_identical_to_reference(heads: int, tokens: int, experts: int, top_k: int) -> None:
     logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")

@@ -76,10 +76,12 @@ def _reference_topk_probs_and_indices(
     return topk_probs, topk_indices
 
 
-# Retirement sentinel floor: the largest finite negative fp32, so that -inf is
-# reserved for lanes the top-k loop has already consumed.  Guarded like the
-# SwiGLU7 constants above, since the placeholder's ``tl.constexpr`` is ``None``.
+# Selection-score bounds: the finite fp32 range, so that -inf is reserved for
+# lanes the top-k loop has already consumed and +inf for NaN lanes, which
+# torch.topk ranks above everything.  Guarded like the SwiGLU7 constants above,
+# since the placeholder's ``tl.constexpr`` is ``None``.
 _MIN_FINITE_FP32 = tl.constexpr(-3.4028234663852886e38) if HAS_TRITON else -3.4028234663852886e38
+_MAX_FINITE_FP32 = tl.constexpr(3.4028234663852886e38) if HAS_TRITON else 3.4028234663852886e38
 
 
 @triton.jit
@@ -136,17 +138,25 @@ def _routing_topk_kernel(
         router_scores = 1.0 / (1.0 + tl.exp(-logits))
     if has_bias:
         bias = tl.load(bias_ptr + head * num_experts + expert_offsets, mask=expert_mask, other=0.0)
-        # The loop below retires a winner by marking it -inf, so -inf must stay
-        # out of reach for anything still selectable.  An unbiased sigmoid is
-        # inside (0, 1), so the bias is the only way in: clamp it to the largest
-        # finite negative float, over the [experts] bank rather than the whole
-        # score tile.
-        selection_scores = router_scores + tl.maximum(bias, _MIN_FINITE_FP32)[None, :]
+        # The loop below retires a winner by marking it -inf, and NaN lanes are
+        # folded to +inf, so both infinities must stay out of reach for a
+        # finite score.  A sigmoid is inside [0, 1], so the bias is the only way
+        # in: clamp it to the finite range, over the [experts] bank rather than
+        # the whole score tile.  The clamp would swallow a NaN bias, which the
+        # reference ranks first, so that passes through untouched.
+        clamped_bias = tl.minimum(tl.maximum(bias, _MIN_FINITE_FP32), _MAX_FINITE_FP32)
+        selection_scores = router_scores + tl.where(bias == bias, clamped_bias, bias)[None, :]
     else:
         selection_scores = router_scores
-    # Dead and padded lanes keep -inf and stay unreachable for good, which is
-    # sound because ``top_k <= num_experts`` leaves an unretired live lane in
-    # every round.
+    # tl.max does not propagate NaN, so a NaN row would match no live lane and
+    # hand the padded sentinel id out of the kernel.  torch.topk ranks NaN above
+    # every number; +inf is otherwise unreachable, so folding NaN onto it keeps
+    # that order and the ids in range.  The route weight is still read from
+    # ``router_scores``, so a NaN logit reaches the output as NaN, as it does in
+    # the reference.  Dead and padded lanes keep -inf and stay unreachable for
+    # good, which is sound because ``top_k <= num_experts`` leaves an unretired
+    # live lane in every round.
+    selection_scores = tl.where(selection_scores == selection_scores, selection_scores, float("inf"))
     selection_scores = tl.where(live, selection_scores, float("-inf"))
 
     route_offsets = tl.arange(0, top_k_pad)
@@ -159,7 +169,8 @@ def _routing_topk_kernel(
         # shape, so recover the winner with a second reduction.  Ties resolve to
         # the lowest expert id, which torch.topk leaves unspecified.  A retired
         # expert sits at -inf, strictly below the clamp above, so it can never
-        # match ``best_score`` and be routed to twice.
+        # match ``best_score`` and be routed to twice.  Scores are NaN-free here,
+        # so ``best_score`` always matches a live lane.
         best_expert = tl.min(tl.where(selection_scores == best_score[:, None], expert_offsets, experts_pad), axis=1)
         selected = expert_offsets[None, :] == best_expert[:, None]
         # The bias steers selection only; the route weight is the unbiased score.
@@ -170,7 +181,10 @@ def _routing_topk_kernel(
         selection_scores = tl.where(selected, float("-inf"), selection_scores)
         l1_norm += tl.abs(probability)
     if route_norm:
-        topk_probs = topk_probs / tl.maximum(l1_norm, norm_eps)[:, None]
+        # F.normalize clamps with clamp_min, which propagates a NaN norm; the
+        # default tl.maximum would replace it with eps and blow the finite
+        # weights of a partly NaN row up to ~1e12 instead.
+        topk_probs = topk_probs / tl.maximum(l1_norm, norm_eps, propagate_nan=tl.PropagateNan.ALL)[:, None]
 
     store_mask = token_mask[:, None] & (route_offsets[None, :] < top_k)
     store_base = (head.to(tl.int64) * num_tokens + token_offsets.to(tl.int64)) * top_k
@@ -258,7 +272,8 @@ def compute_topk_probs_and_indices(
     about 1e-6 relative: the fused sigmoid is within one ULP of
     ``torch.sigmoid`` and the folded L1 normalization sums in a different order.
     Under an exact tie the fused kernel selects the lowest expert id, an order
-    ``torch.topk`` leaves unspecified.
+    ``torch.topk`` leaves unspecified.  NaN selection scores rank first, as in
+    ``torch.topk``, and a NaN logit makes its row's weights NaN in both paths.
     """
 
     if router_logits.ndim != 3:
