@@ -6,6 +6,7 @@ single-flight, and micro-batched encoding."""
 import asyncio
 import threading
 import time
+from tempfile import TemporaryDirectory
 
 import pytest
 import torch
@@ -650,22 +651,25 @@ async def test_inline_index_requires_matching_resolve_key(make_encoder):
     assert audio.resolve_calls == [ref, ref]
 
 
-async def test_inline_reference_shared_across_encoders(make_encoder, tmp_path_factory, monkeypatch):
-    shared_dir = tmp_path_factory.mktemp("ref")
-    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR", str(shared_dir))
-    ref = "data:audio/wav;base64,R0hJ"
-    first_audio, second_audio = _DigestAudio(), _DigestAudio()
-    first_audio.register(ref, 9)
-    second_audio.register(ref, 9)
-    first, second = make_encoder(_FakeProcessor()), make_encoder(_FakeProcessor())
+async def test_inline_reference_shared_across_encoders(make_encoder, monkeypatch):
+    # Keep the AF_UNIX socket path independent of pytest's nested base path.
+    with TemporaryDirectory(prefix="moss-ref-") as shared_dir:
+        monkeypatch.setenv("VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR", shared_dir)
+        ref = "data:audio/wav;base64,R0hJ"
+        first_audio, second_audio = _DigestAudio(), _DigestAudio()
+        first_audio.register(ref, 9)
+        second_audio.register(ref, 9)
+        first, second = make_encoder(_FakeProcessor()), make_encoder(_FakeProcessor())
 
-    a, key_a = await first.encode(ref, resolve_ref_audio=first_audio.resolve, get_artifact_key=first_audio.artifact_key)
-    b, key_b = await second.encode(
-        ref, resolve_ref_audio=second_audio.resolve, get_artifact_key=second_audio.artifact_key
-    )
+        a, key_a = await first.encode(
+            ref, resolve_ref_audio=first_audio.resolve, get_artifact_key=first_audio.artifact_key
+        )
+        b, key_b = await second.encode(
+            ref, resolve_ref_audio=second_audio.resolve, get_artifact_key=second_audio.artifact_key
+        )
 
-    assert first_audio.resolve_calls == [ref] and second_audio.resolve_calls == []
-    assert key_a == key_b and torch.equal(a, b)
+        assert first_audio.resolve_calls == [ref] and second_audio.resolve_calls == []
+        assert key_a == key_b and torch.equal(a, b)
 
 
 # --------------------------------------------------------------------------- #

@@ -8,8 +8,9 @@ import pytest
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
-from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, VLLMScheduler
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -45,10 +46,14 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
 
 @pytest.mark.parametrize("profile", ["high_concurrency", "low_latency"])
 @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-def test_moss_profile_generation_constructor_after_platform_resolution(construct_scheduler, mocker, profile, platform):
-    deploy = _apply_platform_overrides(
-        load_deploy_config(get_deploy_config_path(f"moss_tts_local_mrv2_{profile}.yaml")), platform=platform
-    )
+def test_moss_profile_generation_constructor_after_platform_resolution(
+    construct_scheduler, monkeypatch, mocker, profile, platform
+):
+    # merge_pipeline_deploy owns platform resolution. Mock the detected device
+    # instead of applying an override first and then resolving the worker's
+    # actual platform a second time.
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    deploy = load_deploy_config(get_deploy_config_path(f"moss_tts_local_mrv2_{profile}.yaml"))
     pipeline = resolve_pipeline_config("moss_tts_local")
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
     extras = deploy.connectors["shm"]["extra"]
