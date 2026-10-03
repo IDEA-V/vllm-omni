@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.models.magi2 import mh_moe
+from vllm_omni.diffusion.models.magi2 import fused_moe_kernels
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -28,10 +28,10 @@ def test_expert_kernel_steps_down_from_oversized_blackwell_tile(tokens: int, det
     w_up = torch.randn(1, d_head, d_expert, device=device, dtype=torch.bfloat16) / d_head**0.5
     w_down = torch.randn(1, d_expert, d_head, device=device, dtype=torch.bfloat16) / d_expert**0.5
 
-    mh_moe._RESOLVED_BLOCK_CONFIG.clear()
+    fused_moe_kernels._RESOLVED_BLOCK_CONFIG.clear()
     try:
         with torch.inference_mode():
-            output = mh_moe.triton_mh_moe_forward(
+            output = fused_moe_kernels.triton_mh_moe_forward(
                 x,
                 gather_ids,
                 probs,
@@ -41,7 +41,7 @@ def test_expert_kernel_steps_down_from_oversized_blackwell_tile(tokens: int, det
                 w_down,
                 deterministic=deterministic,
             )
-            expected = mh_moe.torch_mh_moe_forward(
+            expected = fused_moe_kernels.torch_mh_moe_forward(
                 x,
                 gather_ids,
                 probs,
@@ -51,11 +51,11 @@ def test_expert_kernel_steps_down_from_oversized_blackwell_tile(tokens: int, det
                 w_down,
             )
 
-        assert mh_moe._RESOLVED_BLOCK_CONFIG[(d_head, d_expert)] == (64, 64, 32, 2, 8)
+        assert fused_moe_kernels._RESOLVED_BLOCK_CONFIG[(d_head, d_expert)] == (64, 64, 32, 2, 8)
         assert output.shape == x.shape
         assert torch.isfinite(output).all()
         # Torch rounds the gate/up projections to BF16; Triton retains FP32
         # accumulators until the fused activation, so bitwise equality is not expected.
         torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
     finally:
-        mh_moe._RESOLVED_BLOCK_CONFIG.clear()
+        fused_moe_kernels._RESOLVED_BLOCK_CONFIG.clear()
