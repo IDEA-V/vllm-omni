@@ -253,8 +253,8 @@ def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> Non
 
     assert int(indices.min()) >= 0 and int(indices.max()) < experts
     assert (indices.sort(dim=-1).values.diff(dim=-1) > 0).all(), "duplicate route"
-    # NaN rows come out NaN exactly where the reference's do.
-    assert torch.equal(probs.isnan(), reference_probs.isnan())
+    # Compare NaN counts per row: torch.topk leaves tied NaN lanes unordered.
+    assert torch.equal(probs.isnan().sum(dim=-1), reference_probs.isnan().sum(dim=-1))
 
     # Order among NaN lanes is unspecified in torch.topk; the kernel breaks the
     # tie by expert id like any other.
