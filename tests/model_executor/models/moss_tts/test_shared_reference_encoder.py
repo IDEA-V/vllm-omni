@@ -3,6 +3,7 @@
 """API processes share one reference encoder through a Unix socket."""
 
 import threading
+from tempfile import TemporaryDirectory
 
 import pytest
 import torch
@@ -30,10 +31,11 @@ class _Recorder:
 
 
 @pytest.fixture
-def host_dir(tmp_path_factory, monkeypatch):
+def host_dir(monkeypatch):
     monkeypatch.setattr(shared, "_host_lock_handle", None)
     # AF_UNIX limits the full socket path, including pytest directory names.
-    return str(tmp_path_factory.mktemp("ref"))
+    with TemporaryDirectory(prefix="moss-ref-") as path:
+        yield path
 
 
 def test_only_one_process_per_directory_hosts(host_dir):
