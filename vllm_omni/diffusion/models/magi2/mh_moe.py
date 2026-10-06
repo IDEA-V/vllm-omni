@@ -211,7 +211,7 @@ def _fused_routing_supported(
     score_func: RoutingScore,
     expert_bias: torch.Tensor | None,
 ) -> bool:
-    if not router_logits.is_cuda or score_func != "sigmoid":
+    if not (router_logits.is_cuda and current_omni_platform.is_cuda()) or score_func != "sigmoid":
         return False
     # fp32 only: the reference evaluates sigmoid and the L1 norm in the logit
     # dtype, and reproducing narrow-dtype rounding is not worth a second kernel.
