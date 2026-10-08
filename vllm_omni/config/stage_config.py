@@ -480,6 +480,10 @@ class StageDeployConfig:
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
+    # CUDA graph capture of fixed-shape KV-cache decode steps (Qwen-Image-2.1
+    # today). Independent of compilation_config.cudagraph_mode;
+    # enforce_eager=True also disables it.
+    enable_cuda_graph_decode: bool | None = None
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
@@ -536,6 +540,8 @@ class DuplexSessionRuntimeConfig:
     resume_replay_max_bytes_per_session: int = 8 * 1024 * 1024
     max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
     max_pending_turns_per_session: int = 4
+    max_pending_output_bytes_per_session: int = 2 * 1024 * 1024
+    max_pending_output_events_per_session: int = 512
     max_sessions: int = 1
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
@@ -561,6 +567,8 @@ class DuplexSessionRuntimeConfig:
             "resume_replay_max_bytes_per_session": self.resume_replay_max_bytes_per_session,
             "max_pending_input_bytes_per_session": self.max_pending_input_bytes_per_session,
             "max_pending_turns_per_session": self.max_pending_turns_per_session,
+            "max_pending_output_bytes_per_session": self.max_pending_output_bytes_per_session,
+            "max_pending_output_events_per_session": self.max_pending_output_events_per_session,
             "max_sessions": self.max_sessions,
             "completed_append_cache_size": self.completed_append_cache_size,
         }
@@ -910,6 +918,11 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "cuda_mps" in platform_section:
+        cuda_mps = platform_section["cuda_mps"]
+        if not isinstance(cuda_mps, bool):
+            raise ValueError("platform cuda_mps must be a boolean")
+        deploy.cuda_mps = cuda_mps
     if platform_section is not None and "model_runner" in platform_section:
         model_runner = platform_section["model_runner"]
         if model_runner not in ("v1", "v2"):
@@ -1046,7 +1059,7 @@ def _build_engine_args(
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
-    if ps.engine_output_type:
+    if ps.engine_output_type is not None:
         engine_args["engine_output_type"] = ps.engine_output_type
     if next_stage_proc:
         engine_args["custom_process_next_stage_input_func"] = next_stage_proc
